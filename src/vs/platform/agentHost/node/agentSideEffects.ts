@@ -16,9 +16,8 @@ import { IAgent, IAgentAttachment, IAgentProgressEvent, type IAgentToolCompleteE
 import { IDiffComputeService } from '../common/diffComputeService.js';
 import { ISessionDatabase, ISessionDataService } from '../common/sessionDataService.js';
 import type { AgentInfo } from '../common/state/protocol/state.js';
-import { ActionType, SessionAction } from '../common/state/sessionActions.js';
+import { ActionType, StateAction } from '../common/state/sessionActions.js';
 import {
-	CustomizationStatus,
 	PendingMessageKind,
 	ResponsePartKind,
 	SessionStatus,
@@ -26,7 +25,6 @@ import {
 	ToolResultContentType,
 	buildSubagentSessionUri,
 	getToolFileEdits,
-	type SessionCustomization,
 	type SessionState,
 	type ToolResultContent,
 	type ISessionFileDiff,
@@ -126,17 +124,31 @@ export class AgentSideEffects extends Disposable {
 			const agents = this._options.agents.read(reader);
 			this._publishAgentInfos(agents, reader);
 		}));
+
+		// Server-dispatched SessionToolCallComplete actions (e.g. from
+		// the disconnect timeout in ProtocolServerHandler) bypass
+		// handleAction, so the agent's SDK deferred never resolves.
+		// Listen for these envelopes and notify the agent directly.
+		this._register(this._stateManager.onDidEmitEnvelope(envelope => {
+			if (!envelope.origin && envelope.action.type === ActionType.SessionToolCallComplete) {
+				const action = envelope.action;
+				const agent = this._options.getAgent(action.session);
+				agent?.onClientToolCallComplete(URI.parse(action.session), action.toolCallId, action.result);
+			}
+		}));
 	}
 
 	/**
 	 * Publishes agent descriptors using the last known model lists.
 	 */
-	private _publishAgentInfos(agents: readonly IAgent[], reader: IReader): void {
+	private _publishAgentInfos(agents: readonly IAgent[], reader?: IReader): void {
 		const infos: AgentInfo[] = agents.map(a => {
 			const d = a.getDescriptor();
 			const protectedResources = a.getProtectedResources();
+			const models = reader ? a.models.read(reader) : a.models.get();
+			const customizations = a.getCustomizations?.();
 			return {
-				provider: d.provider, displayName: d.displayName, description: d.description, models: a.models.read(reader).map(m => ({
+				provider: d.provider, displayName: d.displayName, description: d.description, models: models.map(m => ({
 					id: m.id,
 					provider: m.provider,
 					name: m.name,
@@ -145,6 +157,7 @@ export class AgentSideEffects extends Disposable {
 					policyState: m.policyState,
 					configSchema: m.configSchema,
 				})),
+				customizations: customizations?.length ? [...customizations] : undefined,
 				protectedResources: protectedResources.length > 0 ? protectedResources : undefined,
 			};
 		});
@@ -153,6 +166,42 @@ export class AgentSideEffects extends Disposable {
 		}
 		this._lastAgentInfos = infos;
 		this._stateManager.dispatchServerAction({ type: ActionType.RootAgentsChanged, agents: infos });
+	}
+
+	private async _publishSessionCustomizations(agent: IAgent, session: ProtocolURI): Promise<void> {
+		if (!agent.getSessionCustomizations) {
+			return;
+		}
+
+		const customizations = await agent.getSessionCustomizations(URI.parse(session));
+		this._stateManager.dispatchServerAction({
+			type: ActionType.SessionCustomizationsChanged,
+			session,
+			customizations: [...customizations],
+		});
+	}
+
+	private _publishSessionCustomizationsSoon(agent: IAgent, session: ProtocolURI): void {
+		void this._publishSessionCustomizations(agent, session).catch(err => {
+			this._logService.error('[AgentSideEffects] getSessionCustomizations failed', err);
+		});
+	}
+
+	private _publishSessionCustomizationsForAgent(agent: IAgent): void {
+		for (const session of this._stateManager.getSessionUris()) {
+			if (this._options.getAgent(session) === agent) {
+				this._publishSessionCustomizationsSoon(agent, session);
+			}
+		}
+	}
+
+	private _publishAllSessionCustomizations(): void {
+		for (const session of this._stateManager.getSessionUris()) {
+			const agent = this._options.getAgent(session);
+			if (agent) {
+				this._publishSessionCustomizationsSoon(agent, session);
+			}
+		}
 	}
 
 	// ---- Initialization ----------------------------------------------------
@@ -185,6 +234,12 @@ export class AgentSideEffects extends Disposable {
 		disposables.add(agent.onDidSessionProgress(e => {
 			this._handleAgentProgress(agent, agentMapper, e);
 		}));
+		if (agent.onDidCustomizationsChange) {
+			disposables.add(agent.onDidCustomizationsChange(() => {
+				this._publishAgentInfos(this._options.agents.get());
+				this._publishSessionCustomizationsForAgent(agent);
+			}));
+		}
 		return disposables;
 	}
 
@@ -579,14 +634,14 @@ export class AgentSideEffects extends Disposable {
 		if (autoApproval !== undefined) {
 			this._toolCallAgents.delete(`${sessionKey}:${e.toolCallId}`);
 			agent.respondToPermissionRequest(e.toolCallId, true);
-			return;
+			e = { ...e, confirmationTitle: undefined }; // don't trigger confirmation
 		}
 		this._stateManager.dispatchServerAction(
 			this._permissionManager.createToolReadyAction(e, sessionKey, turnId)
 		);
 	}
 
-	handleAction(action: SessionAction): void {
+	handleAction(action: StateAction): void {
 		switch (action.type) {
 			case ActionType.SessionTurnStarted: {
 				// Reset the event mapper's part tracking for the new turn
@@ -703,44 +758,27 @@ export class AgentSideEffects extends Disposable {
 				const clientId = action.activeClient?.clientId ?? '';
 				agent.setClientTools(URI.parse(action.session), clientId, action.activeClient?.tools ?? []);
 
-				const refs = action.activeClient?.customizations;
-				if (!refs?.length) {
-					break;
-				}
-				// Publish initial "loading" status for all customizations
-				const loading: SessionCustomization[] = refs.map(r => ({
-					customization: r,
-					enabled: true,
-					status: CustomizationStatus.Loading,
-				}));
-				this._stateManager.dispatchServerAction({
-					type: ActionType.SessionCustomizationsChanged,
-					session: action.session,
-					customizations: loading,
-				});
+				const refs = action.activeClient?.customizations ?? [];
 				agent.setClientCustomizations(
-					action.activeClient!.clientId,
+					clientId,
 					refs,
-					(synced) => {
-						// Incremental progress: publish updated statuses
-						const statuses: SessionCustomization[] = synced.map(s => s.customization);
-						this._stateManager.dispatchServerAction({
-							type: ActionType.SessionCustomizationsChanged,
-							session: action.session,
-							customizations: statuses,
-						});
+					() => {
+						this._publishSessionCustomizationsSoon(agent, action.session);
 					},
-				).then(synced => {
-					// Final status
-					const statuses: SessionCustomization[] = synced.map(s => s.customization);
-					this._stateManager.dispatchServerAction({
-						type: ActionType.SessionCustomizationsChanged,
-						session: action.session,
-						customizations: statuses,
-					});
+				).then(() => {
+					this._publishSessionCustomizationsSoon(agent, action.session);
 				}).catch(err => {
 					this._logService.error('[AgentSideEffects] setClientCustomizations failed', err);
 				});
+				break;
+			}
+			case ActionType.RootConfigChanged: {
+				// Host customizations are self-managed by each agent's
+				// PluginController via IAgentConfigurationService.onDidRootConfigChange.
+				// Republish agent infos for non-customization schema changes
+				// (e.g. permissions) and session customizations as a catchall.
+				this._publishAgentInfos(this._options.agents.get());
+				this._publishAllSessionCustomizations();
 				break;
 			}
 			case ActionType.SessionActiveClientToolsChanged: {
