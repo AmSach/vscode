@@ -2027,6 +2027,17 @@ suite('PromptValidator', () => {
 			assert.deepStrictEqual(markers, [], 'Expected no validation issues for fragment-only anchor links');
 		});
 
+		test('body with fragment-only tool link', async () => {
+			const content = [
+				'---',
+				'description: "Fragment-Only Tool Links"',
+				'---',
+				'Use [tool:foo](#tool:foo) to do something.',
+			].join('\n');
+			const markers = await validate(content, PromptsType.prompt);
+			assert.deepStrictEqual(markers, [], 'Expected no validation issues for fragment-only tool links');
+		});
+
 		test('body with mixed link types', async () => {
 			const nonExistingRef = existingRef1.with({ path: '/nonexisting' });
 			const content = [
